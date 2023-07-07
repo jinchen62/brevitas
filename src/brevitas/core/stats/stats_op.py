@@ -38,8 +38,7 @@ class NegativeMinOrZero(brevitas.jit.ScriptModule):
             min_val = torch.min(x)
         else:
             min_val = torch.min(x, dim=self.stats_reduce_dim, keepdim=self.keepdim)[0]
-        min_val = torch.where(
-            min_val <= self.zero().to(min_val.dtype), min_val, self.zero().to(min_val.dtype))
+        min_val = torch.clamp(min_val, max=self.zero())
         return min_val
 
 
@@ -120,12 +119,15 @@ class PercentileInterval(brevitas.jit.ScriptModule):
             low_percentile_q,
             high_percentile_q,
             stats_reduce_dim: Optional[int] = None,
-            keepdim: bool = False) -> None:
+            keepdim: bool = False,
+            dtype: Optional[torch.dtype] = None,
+            device: Optional[torch.device] = None) -> None:
         super(PercentileInterval, self).__init__()
         self.stats_reduce_dim = stats_reduce_dim
         self.low_q = low_percentile_q
         self.high_q = high_percentile_q
         self.keepdim = keepdim
+        self.zero = StatelessBuffer(torch.tensor(0.0, dtype=dtype, device=device))
 
     @brevitas.jit.script_method
     def forward(self, x: Tensor) -> Tensor:
@@ -146,6 +148,8 @@ class PercentileInterval(brevitas.jit.ScriptModule):
             low_result = x.kthvalue(low_k, dim=self.stats_reduce_dim, keepdim=self.keepdim).values
             high_result = x.kthvalue(high_k, dim=self.stats_reduce_dim, keepdim=self.keepdim).values
         interval = high_result - low_result
+        # We need to make sure the lower bound is not positive to allign with zero-point statistics
+        low_result = torch.clamp(low_result, max=self.zero())
         abs_interval = torch.abs(interval)
         return abs_interval
 
@@ -169,19 +173,28 @@ class AbsMax(brevitas.jit.ScriptModule):
 class AbsMinMax(brevitas.jit.ScriptModule):
     __constants__ = ['stats_reduce_dim', 'keepdim']
 
-    def __init__(self, stats_reduce_dim: Optional[int] = None, keepdim: bool = False) -> None:
+    def __init__(
+            self,
+            stats_reduce_dim: Optional[int] = None,
+            keepdim: bool = False,
+            dtype: Optional[torch.dtype] = None,
+            device: Optional[torch.device] = None) -> None:
         super(AbsMinMax, self).__init__()
         self.stats_reduce_dim = stats_reduce_dim
         self.keepdim = keepdim
+        self.zero = StatelessBuffer(torch.tensor(0.0, dtype=dtype, device=device))
 
     @brevitas.jit.script_method
     def forward(self, x: Tensor):
         if self.stats_reduce_dim is None:
-            return torch.abs(torch.max(x) - torch.min(x))
+            max_val = torch.max(x)
+            min_val = torch.min(x)
         else:
             max_val = torch.max(x, dim=self.stats_reduce_dim, keepdim=self.keepdim)[0]
             min_val = torch.min(x, dim=self.stats_reduce_dim, keepdim=self.keepdim)[0]
-            return torch.abs(max_val - min_val)
+        # We need to make sure the lower bound is not positive to allign with zero-point statistics
+        min_val = torch.clamp(min_val, max=self.zero())
+        return torch.abs(max_val - min_val)
 
 
 class AbsMaxAve(brevitas.jit.ScriptModule):

@@ -1,4 +1,8 @@
 import argparse
+from io import BytesIO
+from typing import List, Tuple
+import random
+import numpy as np
 
 import torch
 from torch import nn
@@ -12,8 +16,33 @@ from brevitas_examples.llm.llm_quant.export import brevitas_layer_export_mode
 from brevitas_examples.llm.llm_quant.export import brevitas_proxy_export_mode
 from brevitas_examples.llm.llm_quant.export import LinearWeightBlockQuantHandler
 from brevitas_examples.llm.llm_quant.export import replace_call_fn_target
-from brevitas_examples.llm.llm_quant.mlir_custom_mm import brevitas_matmul_rhs_group_quant_library
+from brevitas_examples.llm.llm_quant.mlir_custom_mm import *
 from brevitas_examples.llm.llm_quant.quantize import quantize_model
+
+
+def brevitas〇matmul_rhs_group_quant〡shape(lhs: List[int], rhs: List[int], rhs_scale: List[int], rhs_zero_point: List[int], rhs_bit_width: int, rhs_group_size: int) -> List[int]:
+    if len(lhs) == 3 and len(rhs) == 2:
+        return [lhs[0], lhs[1], rhs[0]]
+    elif len(lhs) == 2 and len(rhs) == 2:
+        return [lhs[0], rhs[0]]
+    else:
+        raise ValueError("Input shapes not supported.")
+
+
+def brevitas〇matmul_rhs_group_quant〡dtype(lhs_rank_dtype: Tuple[int, int], rhs_rank_dtype: Tuple[int, int], rhs_scale_rank_dtype: Tuple[int, int], rhs_zero_point_rank_dtype: Tuple[int, int], rhs_bit_width: int, rhs_group_size: int) -> int:
+    # output dtype is the dtype of the lhs float input
+    lhs_rank, lhs_dtype = lhs_rank_dtype
+    return lhs_dtype
+
+
+def brevitas〇matmul_rhs_group_quant〡has_value_semantics(lhs, rhs, rhs_scale, rhs_zero_point, rhs_bit_width, rhs_group_size) -> None:
+    return
+
+
+brevitas_matmul_rhs_group_quant_library = [
+    brevitas〇matmul_rhs_group_quant〡shape,
+    brevitas〇matmul_rhs_group_quant〡dtype,
+    brevitas〇matmul_rhs_group_quant〡has_value_semantics]
 
 
 # Due a tracing issue this annotation needs to be
@@ -41,7 +70,7 @@ class Model(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.layer = nn.Linear(128, 256, bias=True)
+        self.layer = nn.Linear(12, 8, bias=True)
 
     def forward(self, x):
         return self.layer(x)
@@ -50,6 +79,10 @@ class Model(nn.Module):
 def quantize_and_export(args):
     # Init model
     model = Model()
+    model_i4 = Model()
+    # torch.save(model.state_dict(), "test_model.pt")
+    model.load_state_dict(torch.load("test_model.pt"))
+    model_i4.load_state_dict(torch.load("test_model.pt"))
 
     # Run quantization
     quantize_model(
@@ -62,9 +95,34 @@ def quantize_and_export(args):
         weight_scale_precision='float',
         weight_quant_granularity='per_group',
         quantize_weight_zero_point=False)
+    quantize_model(
+        model_i4,
+        dtype=torch.float32,
+        weight_quant_type=args.weight_quant_type,
+        weight_bit_width=4,
+        weight_group_size=args.weight_group_size,
+        weight_param_method='stats',
+        weight_scale_precision='float',
+        weight_quant_granularity='per_group',
+        quantize_weight_zero_point=False)
 
     # Run a test forward pass
-    model(torch.randn(2, 128))
+    # inputs = torch.randn(8, 12)
+    # torch.save(inputs, "test_inputs.pt")
+    inputs = torch.load('test_inputs.pt')
+    # print(inputs)
+    outputs = model(inputs)
+    outputs_i4 = model_i4(inputs)
+    # print("torch model output")
+    # print(outputs)
+    # print(outputs_i4)
+    # percentage_error = abs((outputs - outputs_i4) / outputs) * 100
+    # print(percentage_error)
+    i8_results = np.load('/home/jinchen/jinchen62/iree/test_i8.npy')
+    i4_results = np.load('/home/jinchen/jinchen62/iree/test_i4.npy')
+    percentage_error = abs((i8_results - i4_results) / i8_results) * 100
+    print(percentage_error)
+    exit()
 
     # Pick export mode
     if not args.no_custom_packed_export:
@@ -78,25 +136,37 @@ def quantize_and_export(args):
 
     # export with make_fx with support for fx wrap
     with export_context_manager(model, export_class):
-        traced_model = make_fx(model)(torch.randn(2, 128))
+        traced_model = make_fx(model)(inputs)
 
     # Replace placeholder for custom op with correct call, if any
     replace_call_fn_target(
         traced_model,
         src=matmul_rhs_group_quant_placeholder,
         target=torch.ops.brevitas.matmul_rhs_group_quant)
+    outputs = traced_model(inputs)
+    print("traced model output")
+    print(outputs)
+    # exit()
 
     # print the output graph
-    print(traced_model.graph)
+    # print(traced_model.graph)
 
-    torch_mlir.compile(
+    module = torch_mlir.compile(
         traced_model,
-        torch.randn(2, 128),
+        [inputs],
         output_type="torch",
         backend_legal_ops=["brevitas.matmul_rhs_group_quant"],
         extra_library=brevitas_matmul_rhs_group_quant_library,
         use_tracing=True,
         verbose=False)
+
+    # bytecode = str(module).encode("UTF-8")
+    # bytecode_stream = BytesIO(bytecode)
+    # bytecode = bytecode_stream.read()
+
+    # f_ = open("test.mlir", "wb")
+    # f_.write(bytecode)
+    # f_.close()
 
 
 def main():
@@ -112,7 +182,7 @@ def main():
     parser.add_argument(
         '--weight-group-size',
         type=int,
-        default=128,
+        default=4,
         help='Group size for group weight quantization.')
     parser.add_argument(
         '--no-custom-packed-export',
@@ -123,4 +193,7 @@ def main():
 
 
 if __name__ == "__main__":
+    # random.seed(0)
+    # np.random.seed(0)
+    # torch.manual_seed(0)
     main()
